@@ -27,16 +27,18 @@ def main() -> None:
     feature_names.append("user_mean_rating")
 
     coefs = model.coef_
+    coef_names = list(zip(coefs, feature_names))
 
     print("\n=== Top Positive Features (push rating higher) ===")
-    top_pos = sorted(zip(coefs, feature_names), reverse=True)[:15]
+    top_pos = sorted([x for x in coef_names if x[0] > 0], reverse=True)[:15]
     for w, name in top_pos:
         print(f"{w:+.4f}   {name}")
 
     print("\n=== Top Negative Features (push rating lower) ===")
-    top_neg = sorted(zip(coefs, feature_names))[:15]
+    top_neg = sorted([x for x in coef_names if x[0] < 0])[:15]
     for w, name in top_neg:
         print(f"{w:+.4f}   {name}")
+
 
     print("\nDone.")
 
