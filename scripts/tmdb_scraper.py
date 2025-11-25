@@ -1,21 +1,3 @@
-"""
-Simple TMDB movie scraper.
-
-- Reads TMDB_API_KEY from the environment
-- Reads a text file with one TMDB movie id per line
-- For each id, calls the TMDB API and stores the result in tmdb.sqlite
-- Stores:
-    - movies table (basic info)
-    - genres + movie_genres
-    - keywords + movie_keywords
-
-Usage:
-  export TMDB_API_KEY=...
-  python tmdb_scraper_simple.py \
-      --ids-file tmdb_ids_to_scrape.txt \
-      --db tmdb.sqlite
-"""
-
 from __future__ import annotations
 import argparse
 import os
@@ -75,31 +57,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE,
             FOREIGN KEY(genre_id) REFERENCES genres(id) ON DELETE CASCADE
         );
-
-        CREATE TABLE IF NOT EXISTS keywords (
-            id INTEGER PRIMARY KEY,
-            tmdb_id INTEGER UNIQUE,
-            name TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS movie_keywords (
-            movie_id INTEGER,
-            keyword_id INTEGER,
-            UNIQUE(movie_id, keyword_id),
-            FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE,
-            FOREIGN KEY(keyword_id) REFERENCES keywords(id) ON DELETE CASCADE
-        );
         """
     )
     conn.commit()
 
 
-def get_or_create(
-    conn: sqlite3.Connection,
-    table: str,
-    tmdb_id: int,
-    name: str,
-) -> int:
+def get_or_create(conn: sqlite3.Connection, table: str, tmdb_id: int, name: str) -> int:
     """Return local row id for a TMDB id, inserting if needed."""
     cur = conn.execute(f"SELECT id FROM {table} WHERE tmdb_id = ?", (tmdb_id,))
     row = cur.fetchone()
@@ -124,11 +87,10 @@ def get_api_key() -> str:
 
 
 def fetch_movie(tmdb_id: int, retries: int = 3) -> Dict[str, Any]:
-    """Fetch full movie details (including keywords and credits)."""
+    """Fetch movie details (including keywords)."""
     api_key = get_api_key()
     params = {
         "api_key": api_key,
-        "append_to_response": "keywords,credits",
     }
 
     url = f"{BASE_URL}/movie/{tmdb_id}"
@@ -136,7 +98,6 @@ def fetch_movie(tmdb_id: int, retries: int = 3) -> Dict[str, Any]:
         try:
             resp = requests.get(url, params=params, timeout=15)
             if resp.status_code == 429:
-                # too many requests -> wait and retry
                 wait = int(resp.headers.get("Retry-After", "2"))
                 time.sleep(wait)
                 continue
@@ -155,7 +116,7 @@ def save_movie(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
     tmdb_id = int(payload["id"])
     cur = conn.cursor()
 
-    # 1) upsert movie row
+    # upsert movie row
     cur.execute(
         """
         INSERT INTO movies (
@@ -187,13 +148,13 @@ def save_movie(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
         ),
     )
 
-    # get local movie id
+    # local movie id
     cur.execute("SELECT id FROM movies WHERE tmdb_id = ?", (tmdb_id,))
     movie_rowid = cur.fetchone()[0]
 
-    # 2) genres
+    # genres
     cur.execute("DELETE FROM movie_genres WHERE movie_id = ?", (movie_rowid,))
-    genre_rows: List[tuple[int, int]] = []
+    genre_rows: list[tuple[int, int]] = []
     for g in payload.get("genres", []):
         gid = get_or_create(conn, "genres", g["id"], g.get("name", ""))
         genre_rows.append((movie_rowid, gid))
@@ -202,26 +163,12 @@ def save_movie(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
         genre_rows,
     )
 
-    # 3) keywords
-    cur.execute("DELETE FROM movie_keywords WHERE movie_id = ?", (movie_rowid,))
-    kw_container = payload.get("keywords") or {}
-    kw_list = kw_container.get("keywords") if isinstance(kw_container, dict) else kw_container
-    kw_rows: List[tuple[int, int]] = []
-    for kw in (kw_list or []):
-        kid = get_or_create(conn, "keywords", kw["id"], kw.get("name", ""))
-        kw_rows.append((movie_rowid, kid))
-    cur.executemany(
-        "INSERT OR IGNORE INTO movie_keywords (movie_id, keyword_id) VALUES (?, ?)",
-        kw_rows,
-    )
-
     conn.commit()
-
 
 # ---------- CLI ----------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Simple TMDB scraper")
+    ap = argparse.ArgumentParser(description="Simple TMDB scraper.")
     ap.add_argument("--ids-file", type=Path, required=True,
                     help="Text file with one TMDB id per line")
     ap.add_argument("--db", default="tmdb.sqlite",
@@ -247,7 +194,7 @@ def main() -> int:
             payload = fetch_movie(tmdb_id)
             save_movie(conn, payload)
             print(f"✓ saved {payload.get('title')} (TMDB {tmdb_id})")
-            time.sleep(0.3)  # gentle delay
+            time.sleep(0.3)
         except Exception as e:
             print(f"✗ failed {tmdb_id}: {e}", file=sys.stderr)
 

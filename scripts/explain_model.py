@@ -1,46 +1,27 @@
-"""
-Explain Ridge regression model trained with train_model.py.
-
-Shows:
-- Coefficients for genre features
-- Coefficients for numeric movie features
-- Coefficient for user_mean_rating
-
-Usage:
-  python explain_model.py --model models/ridge_rating_model.joblib \
-                          --features feature_store/movie_features.joblib
-"""
-
 from __future__ import annotations
 import argparse
 import joblib
-import numpy as np
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Explain Ridge rating model coefficients.")
     ap.add_argument("--model", required=True, help="Path to ridge_rating_model.joblib")
     ap.add_argument("--features", required=True, help="Path to movie_features.joblib")
     args = ap.parse_args()
 
-    payload = joblib.load(args.model)
-    model = payload["model"]
+    model_payload = joblib.load(args.model)
+    model = model_payload["model"]
 
     fs = joblib.load(args.features)
     tfidf = fs["tfidf"]
     num_names = fs["feature_names"]["numeric"]
 
-    # Build feature name list
-    feature_names = []
-
-    # TF-IDF genre names
+    # TF-IDF genre names (sorted by index)
     vocab_items = sorted(tfidf.vocabulary_.items(), key=lambda x: x[1])
-    for tok, idx in vocab_items:
-        feature_names.append(f"genre:{tok}")
+    feature_names = [f"genre:{tok}" for tok, _ in vocab_items]
 
     # Numeric names
-    for n in num_names:
-        feature_names.append(f"num:{n}")
+    feature_names.extend(f"num:{n}" for n in num_names)
 
     # User feature
     feature_names.append("user_mean_rating")

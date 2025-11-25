@@ -1,20 +1,3 @@
-"""
-Convert MovieLens ratings into interactions linked to TMDB movies.
-
-- Reads MovieLens ratings.csv and links.csv
-- Joins with tmdb.sqlite (movies table)
-- Keeps: userId, movie_rowid, tmdb_id, rating, timestamp, title
-- Ratings are kept as-is (1–5)
-
-Usage:
-  python movielens_to_interactions_simple.py \
-      --ml-dir ml-latest-small \
-      --sqlite tmdb.sqlite \
-      --min-user-ratings 5 \
-      --min-movie-ratings 5 \
-      --out dataset/interactions.parquet
-"""
-
 from __future__ import annotations
 import argparse
 import sqlite3
@@ -24,15 +7,13 @@ import pandas as pd
 
 
 def load_movielens(ml_dir: Path):
+    """Load MovieLens ratings + links (basic cleanup)."""
     ratings = pd.read_csv(ml_dir / "ratings.csv")
-    links   = pd.read_csv(ml_dir / "links.csv")
+    links = pd.read_csv(ml_dir / "links.csv")
 
-    # basic type cleanup
     ratings["userId"] = ratings["userId"].astype(int)
     ratings["movieId"] = ratings["movieId"].astype(int)
-    # assume timestamp in seconds (as in official MovieLens)
     ratings["timestamp"] = ratings["timestamp"].astype(int)
-    # ratings assumed to be 1.0, 2.0, 3.0, 4.0, 5.0
     ratings["rating"] = ratings["rating"].astype(float)
 
     links["movieId"] = links["movieId"].astype(int)
@@ -55,7 +36,9 @@ def load_tmdb_movies(sqlite_path: Path) -> pd.DataFrame:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build interactions from MovieLens + TMDB movies")
+    ap = argparse.ArgumentParser(
+        description="Convert MovieLens ratings into interactions linked to TMDB movies."
+    )
     ap.add_argument("--ml-dir", type=Path, required=True,
                     help="Path to MovieLens directory (ratings.csv, links.csv)")
     ap.add_argument("--sqlite", type=Path, required=True,
