@@ -4,10 +4,12 @@ import os
 import sqlite3
 import sys
 import time
+from collections import deque
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
-import requests
+import asyncio
+import aiohttp
 
 try:
     from dotenv import load_dotenv
@@ -23,6 +25,8 @@ BASE_URL = "https://api.themoviedb.org/3"
 def get_conn(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
 
@@ -86,26 +90,62 @@ def get_api_key() -> str:
     return key
 
 
-def fetch_movie(tmdb_id: int, retries: int = 3) -> Dict[str, Any]:
-    """Fetch movie details (including keywords)."""
-    api_key = get_api_key()
-    params = {
-        "api_key": api_key,
-    }
+# Simple async rate limiter: max_calls per period seconds (sliding window)
+class RateLimiter:
+    def __init__(self, max_calls: int, period: float) -> None:
+        self.max_calls = max_calls
+        self.period = period
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
 
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+
+            # Drop old entries
+            while self._calls and self._calls[0] <= now - self.period:
+                self._calls.popleft()
+
+            if len(self._calls) >= self.max_calls:
+                wait_for = self.period - (now - self._calls[0])
+                await asyncio.sleep(wait_for)
+                # After sleeping, call again to recompute window
+                return await self.acquire()
+
+            self._calls.append(now)
+
+
+async def fetch_movie_async(
+    session: aiohttp.ClientSession,
+    tmdb_id: int,
+    api_key: str,
+    limiter: RateLimiter,
+    retries: int = 3,
+) -> Dict[str, Any]:
+    """Async fetch movie details with retry and 429 handling."""
+    params = {"api_key": api_key}
     url = f"{BASE_URL}/movie/{tmdb_id}"
+
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", "2"))
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as e:
-            print(f"Request failed for {tmdb_id}: {e}", file=sys.stderr)
-            time.sleep(1.0)
+            await limiter.acquire()
+            async with session.get(url, params=params, timeout=15) as resp:
+                if resp.status == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = int(retry_after) if retry_after and retry_after.isdigit() else 2
+                    print(f"429 for {tmdb_id}, retrying in {wait}s...", file=sys.stderr)
+                    await asyncio.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                return await resp.json()
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"Request failed for {tmdb_id} (attempt {attempt+1}/{retries}): {e}",
+                  file=sys.stderr)
+            await asyncio.sleep(1.0)
+
     raise RuntimeError(f"Failed to fetch TMDB id {tmdb_id} after {retries} attempts")
 
 
@@ -116,7 +156,6 @@ def save_movie(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
     tmdb_id = int(payload["id"])
     cur = conn.cursor()
 
-    # upsert movie row
     cur.execute(
         """
         INSERT INTO movies (
@@ -163,12 +202,54 @@ def save_movie(conn: sqlite3.Connection, payload: Dict[str, Any]) -> None:
         genre_rows,
     )
 
-    conn.commit()
+
+# ---------- async orchestration ----------
+
+async def fetch_all_movies(ids: List[int]) -> List[Dict[str, Any]]:
+    api_key = get_api_key()
+    limiter = RateLimiter(max_calls=50, period=1.0)  # 50 requests / second
+    semaphore = asyncio.Semaphore(20)  # max 20 concurrent connections
+
+    results: List[Dict[str, Any]] = []
+
+    async with aiohttp.ClientSession() as session:
+        async def worker(tmdb_id: int) -> Tuple[int, Dict[str, Any] | None]:
+            try:
+                async with semaphore:
+                    payload = await fetch_movie_async(
+                        session=session,
+                        tmdb_id=tmdb_id,
+                        api_key=api_key,
+                        limiter=limiter,
+                    )
+                return tmdb_id, payload
+            except Exception as e:
+                print(f"✗ failed {tmdb_id}: {e}", file=sys.stderr)
+                return tmdb_id, None
+
+        tasks = [asyncio.create_task(worker(tmdb_id)) for tmdb_id in ids]
+
+        # Use as_completed to get results as they arrive
+        completed = 0
+        total = len(tasks)
+        for coro in asyncio.as_completed(tasks):
+            tmdb_id, payload = await coro
+            completed += 1
+            if payload is not None:
+                results.append(payload)
+                title = payload.get("title") or "(no title)"
+                print(f"[{completed}/{total}] ✓ fetched {title} (TMDB {tmdb_id})")
+            else:
+                print(f"[{completed}/{total}] ✗ no payload for TMDB {tmdb_id}",
+                      file=sys.stderr)
+
+    return results
+
 
 # ---------- CLI ----------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Simple TMDB scraper.")
+    ap = argparse.ArgumentParser(description="Fast TMDB scraper with async + rate limiting.")
     ap.add_argument("--ids-file", type=Path, required=True,
                     help="Text file with one TMDB id per line")
     ap.add_argument("--db", default="tmdb.sqlite",
@@ -186,19 +267,32 @@ def main() -> int:
         print("No valid ids in file!", file=sys.stderr)
         return 1
 
+    # 1) Fetch all movies via async HTTP, respecting rate limits
+    start_time = time.time()
+    payloads = asyncio.run(fetch_all_movies(ids))
+    fetch_duration = time.time() - start_time
+    print(f"\nFetched {len(payloads)} movies in {fetch_duration:.1f} seconds.")
+
+    # 2) Store them in SQLite (single-threaded, batched transaction)
     conn = get_conn(args.db)
     init_db(conn)
 
-    for tmdb_id in ids:
-        try:
-            payload = fetch_movie(tmdb_id)
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    try:
+        for idx, payload in enumerate(payloads, start=1):
             save_movie(conn, payload)
-            print(f"✓ saved {payload.get('title')} (TMDB {tmdb_id})")
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"✗ failed {tmdb_id}: {e}", file=sys.stderr)
+            title = payload.get("title") or "(no title)"
+            print(f"[DB {idx}/{len(payloads)}] saved {title} (TMDB {payload['id']})")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    conn.close()
+    total_duration = time.time() - start_time
+    print(f"\nAll done in {total_duration:.1f} seconds.")
     return 0
 
 

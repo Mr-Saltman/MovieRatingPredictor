@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 import argparse
 from pathlib import Path
+from typing import Dict
 
 import joblib
 import numpy as np
@@ -39,6 +39,65 @@ def load_movie_features(path: Path) -> dict:
     return joblib.load(path)
 
 
+# ---------- small helpers ----------
+
+def l2_normalize(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Return vec / ||vec|| (L2 norm), or vec if norm is too small."""
+    norm = np.linalg.norm(vec)
+    if norm < eps:
+        return vec
+    return vec / norm
+
+
+def build_user_profiles_from_interactions(
+    interactions: pd.DataFrame,
+    X_tfidf,
+    min_ratings: int = 5,
+) -> Dict[int, np.ndarray]:
+    """
+    Build a simple genre profile for each user in the interactions.
+
+    For each user:
+      - take the TF-IDF rows of the movies they rated
+      - compute a weighted average using ratings as weights
+      - L2-normalize
+
+    Returns:
+      profiles: {userId: profile_vector}
+    """
+    profiles: Dict[int, np.ndarray] = {}
+
+    for uid, grp in interactions.groupby("userId"):
+        if len(grp) < min_ratings:
+            continue
+
+        rows = grp["row_idx"].to_numpy(dtype=int)
+
+        r = grp["rating"].to_numpy(dtype=float)
+        r_mean = r.mean()
+        deltas = r - r_mean
+
+        pos_mask = deltas > 0.0
+        if not np.any(pos_mask):
+            continue
+
+        rows = rows[pos_mask]
+        weights = deltas[pos_mask].reshape(-1, 1)
+
+        V = X_tfidf[rows]            # (n_liked, d)
+        num = V.T @ weights          # (d, 1)
+        centroid = np.asarray(num).ravel()
+        denom = weights.sum()
+        if denom <= 0:
+            continue
+
+        centroid = centroid / denom
+        centroid = l2_normalize(centroid)
+        profiles[int(uid)] = centroid
+
+    return profiles
+
+
 # ---------- feature builder ----------
 
 def build_design_matrix(
@@ -50,7 +109,7 @@ def build_design_matrix(
     """
     Build the feature matrix X and target vector y.
 
-    X = [movie_tfidf | movie_numeric | user_mean_rating]
+    X = [movie_tfidf | movie_numeric | user_mean_rating | user_movie_sim]
     y = rating
     """
     # Map movie_rowid -> row index in X_tfidf / num
@@ -69,9 +128,9 @@ def build_design_matrix(
 
     # movie features
     rows = interactions["row_idx"].to_numpy(dtype=int)
-    X_text = X_tfidf[rows]           # sparse
-    X_num_dense = num[rows]          # (n_samples, d_num)
-    X_num = csr_matrix(X_num_dense)  # as sparse
+    X_text = X_tfidf[rows]            # sparse
+    X_num_dense = num[rows]           # (n_samples, d_num)
+    X_num = csr_matrix(X_num_dense)   # as sparse
 
     # user feature: mean rating per user (user bias)
     interactions["user_mean_rating"] = (
@@ -80,8 +139,30 @@ def build_design_matrix(
     user_mean_col = interactions["user_mean_rating"].to_numpy(dtype=float).reshape(-1, 1)
     X_user = csr_matrix(user_mean_col)  # (n_samples, 1)
 
-    # Stack everything horizontally: [tfidf | numeric | user_mean]
-    X = hstack([X_text, X_num, X_user]).tocsr()
+    # user–movie similarity in genre TF-IDF space
+    # 1) build user profiles using all interactions with row_idx
+    profiles = build_user_profiles_from_interactions(
+        interactions,
+        X_tfidf=X_tfidf,
+        min_ratings=5,
+    )
+
+    # 2) compute similarity for each interaction row
+    sims = np.zeros(len(interactions), dtype=np.float32)
+    # X_tfidf rows are L2-normalized (TfidfVectorizer default), and we L2-normalize profiles,
+    # so dot product ≈ cosine similarity.
+    for i, row in enumerate(interactions.itertuples(index=False)):
+        prof = profiles.get(row.userId)
+        if prof is None:
+            continue
+        v = X_tfidf[row.row_idx]                    # (1, d)
+        sims[i] = float(v.dot(prof)[0])             # scalar
+
+    sims *= 10.0  # scale
+    X_sim = csr_matrix(sims.reshape(-1, 1))         # (n_samples, 1)
+
+    # Stack everything horizontally: [tfidf | numeric | user_mean | user_movie_sim]
+    X = hstack([X_text, X_num, X_user, X_sim]).tocsr()
     y = interactions["rating"].to_numpy(dtype=float)
 
     return X, y
@@ -147,7 +228,10 @@ def train_model(
         "interactions_path": str(interactions_path),
         "n_features": X.shape[1],
         "max_samples": max_samples,
-        "description": "Ridge regression: [movie_tfidf | movie_numeric | user_mean_rating] -> rating",
+        "description": (
+            "Ridge regression: [movie_tfidf | movie_numeric | "
+            "user_mean_rating | user_movie_sim] -> rating"
+        ),
     }
     joblib.dump(payload, model_out)
     print(f"\n✓ Saved trained model to {model_out}")
@@ -157,21 +241,42 @@ def train_model(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train a Ridge regression rating predictor.")
-    ap.add_argument("--interactions", type=Path, required=True,
-                    help="Path to interactions .csv or .parquet (with userId, movie_rowid, rating)")
-    ap.add_argument("--features", type=Path,
-                    default=Path("feature_store/movie_features.joblib"),
-                    help="Path to movie_features.joblib")
-    ap.add_argument("--model-out", type=Path,
-                    default=Path("models/ridge_rating_model.joblib"),
-                    help="Path to save trained model (joblib file)")
-    ap.add_argument("--test-size", type=float, default=0.2,
-                    help="Fraction of data to use as test set")
-    ap.add_argument("--alpha", type=float, default=1.0,
-                    help="Ridge regularization strength")
-    ap.add_argument("--max-samples", type=int, default=200_000,
-                    help="Maximum number of interactions to use for training "
-                         "(set to -1 to use all)")
+    ap.add_argument(
+        "--interactions",
+        type=Path,
+        required=True,
+        help="Path to interactions .csv or .parquet (with userId, movie_rowid, rating)",
+    )
+    ap.add_argument(
+        "--features",
+        type=Path,
+        default=Path("feature_store/movie_features.joblib"),
+        help="Path to movie_features.joblib",
+    )
+    ap.add_argument(
+        "--model-out",
+        type=Path,
+        default=Path("models/ridge_rating_model.joblib"),
+        help="Path to save trained model (joblib file)",
+    )
+    ap.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Fraction of data to use as test set",
+    )
+    ap.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Ridge regularization strength",
+    )
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=200_000,
+        help="Maximum number of interactions to use for training (set to -1 to use all)",
+    )
     return ap.parse_args()
 
 

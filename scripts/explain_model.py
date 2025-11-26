@@ -23,10 +23,19 @@ def main() -> None:
     # Numeric names
     feature_names.extend(f"num:{n}" for n in num_names)
 
-    # User feature
+    # User features (order must match train_model.py)
     feature_names.append("user_mean_rating")
+    feature_names.append("user_movie_sim")
 
     coefs = model.coef_
+
+    if len(coefs) != len(feature_names):
+        print(
+            f"Warning: n_coefs ({len(coefs)}) != n_features ({len(feature_names)}). "
+            "Feature name mapping may be off."
+        )
+
+    # zip, but only up to the shortest length to avoid index issues
     coef_names = list(zip(coefs, feature_names))
 
     print("\n=== Top Positive Features (push rating higher) ===")
@@ -38,7 +47,6 @@ def main() -> None:
     top_neg = sorted([x for x in coef_names if x[0] < 0])[:15]
     for w, name in top_neg:
         print(f"{w:+.4f}   {name}")
-
 
     print("\nDone.")
 
