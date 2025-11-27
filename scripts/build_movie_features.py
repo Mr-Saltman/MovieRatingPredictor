@@ -1,154 +1,228 @@
 from __future__ import annotations
 import argparse
 import os
-import sqlite3
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
+import re
 
 
-def load_tables(db_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load movies and genre tokens from tmdb.sqlite."""
-    con = sqlite3.connect(db_path)
-    try:
-        movies = pd.read_sql(
-            """
-            SELECT id AS movie_rowid,
-                   tmdb_id,
-                   title,
-                   overview,
-                   COALESCE(runtime, 0)        AS runtime,
-                   COALESCE(vote_average, 0)   AS vote_avg,
-                   COALESCE(vote_count, 0)     AS vote_count,
-                   COALESCE(popularity, 0)     AS popularity,
-                   release_date
-            FROM movies
-            """,
-            con,
-        )
+def load_movielens(ml_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load MovieLens movies, ratings, tags (+ links for tmdb_id)."""
+    movies = pd.read_csv(ml_dir / "movies.csv")
+    ratings = pd.read_csv(ml_dir / "ratings.csv")
 
-        genres = pd.read_sql(
-            """
-            SELECT mg.movie_id AS movie_rowid,
-                   g.name      AS token
-            FROM movie_genres mg
-            JOIN genres g ON mg.genre_id = g.id
-            """,
-            con,
-        )
-    finally:
-        con.close()
+    tags_path = ml_dir / "tags.csv"
+    if tags_path.exists():
+        tags = pd.read_csv(tags_path)
+    else:
+        tags = pd.DataFrame(columns=["userId", "movieId", "tag", "timestamp"])
 
-    return movies, genres
+    # NEW: links for tmdb_id
+    links = pd.read_csv(ml_dir / "links.csv")
+    links["movieId"] = links["movieId"].astype(int)
+    links = links.dropna(subset=["tmdbId"]).copy()
+    links["tmdbId"] = links["tmdbId"].astype(int)
+
+    # Basic dtypes
+    movies["movieId"] = movies["movieId"].astype(int)
+    ratings["movieId"] = ratings["movieId"].astype(int)
+    ratings["userId"] = ratings["userId"].astype(int)
+    ratings["rating"] = ratings["rating"].astype(float)
+
+    if not tags.empty:
+        tags["movieId"] = tags["movieId"].astype(int)
+        tags["tag"] = tags["tag"].astype(str)
+
+    # Attach tmdb_id
+    movies = movies.merge(links[["movieId", "tmdbId"]], on="movieId", how="left")
+    movies = movies.rename(columns={"tmdbId": "tmdb_id"})
+
+    return movies, ratings, tags
 
 
-def bag_tokens(df: pd.DataFrame, movies: pd.DataFrame) -> pd.Series:
+def extract_year_from_title(title: str) -> float | np.nan:
     """
-    Turn (movie_rowid, token) rows into a single 'token1 token2 ...' string per movie.
-    Always returns strings (no NaNs), indexed by movie_rowid.
+    MovieLens titles often look like 'Toy Story (1995)'.
+    Extract the year as a float, or NaN if not found.
     """
-    if df.empty:
-        return pd.Series([""] * len(movies), index=movies["movie_rowid"])
+    if not isinstance(title, str):
+        return np.nan
+    m = re.search(r"\((\d{4})\)\s*$", title)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return np.nan
+    return np.nan
 
-    bag = (
-        df.groupby("movie_rowid")["token"]
-          .apply(lambda xs: " ".join(sorted({str(x) for x in xs if pd.notna(x)})))
+
+def build_numeric_features(movies: pd.DataFrame, ratings: pd.DataFrame) -> np.ndarray:
+    """
+    Build numeric features for each movie:
+
+      - global_mean_rating     (MovieLens mean rating per movie)
+      - log1p_rating_count     (log(1 + #ratings))
+      - year_norm              (release year normalized to [0, 1])
+
+    Returns:
+      num: ndarray of shape (n_movies, 3)
+    """
+    # Aggregate stats from ratings
+    stats = (
+        ratings.groupby("movieId")["rating"]
+        .agg(["count", "mean"])
+        .rename(columns={"count": "n_ratings", "mean": "mean_rating"})
+        .reset_index()
     )
-    bag = bag.reindex(movies["movie_rowid"]).fillna("")
-    return bag.astype(str)
+
+    movies = movies.merge(stats, on="movieId", how="left")
+
+    # Fill missing stats
+    global_mean = ratings["rating"].mean()
+    movies["n_ratings"] = movies["n_ratings"].fillna(0.0)
+    movies["mean_rating"] = movies["mean_rating"].fillna(global_mean)
+
+    # Extract year from title
+    movies["year"] = movies["title"].apply(extract_year_from_title)
+    year_min = movies["year"].min(skipna=True)
+    year_max = movies["year"].max(skipna=True)
+
+    if pd.isna(year_min) or pd.isna(year_max) or year_min == year_max:
+        # If we don't have usable years, just put 0.5 for everyone
+        movies["year_norm"] = 0.5
+    else:
+        movies["year_norm"] = (movies["year"] - year_min) / (year_max - year_min)
+        movies["year_norm"] = movies["year_norm"].fillna(0.5)
+
+    # Build numeric feature matrix
+    mean_rating = movies["mean_rating"].to_numpy(dtype=np.float32)
+    log_n = np.log1p(movies["n_ratings"].to_numpy(dtype=np.float32))
+    year_norm = movies["year_norm"].to_numpy(dtype=np.float32)
+
+    num = np.c_[mean_rating, log_n, year_norm]
+    return num, movies
 
 
-def build_numeric_features(movies: pd.DataFrame) -> np.ndarray:
-    """Build numeric feature matrix for each movie."""
-    # recency: newer movies → larger value
-    rel_dates = pd.to_datetime(movies["release_date"], errors="coerce", utc=True)
-    now = pd.Timestamp.now(tz="UTC")
+def build_text_corpus(movies: pd.DataFrame, tags: pd.DataFrame) -> np.ndarray:
+    """
+    Build a text corpus per movie by combining:
 
-    # age in years (fallback: 100 years for missing dates)
-    age_years = ((now - rel_dates).dt.total_seconds() / (365.25 * 24 * 3600))
-    age_years = age_years.fillna(100.0)
+      - genres from movies.csv
+      - tags from tags.csv
 
-    inv_recency = 1.0 / (1.0 + age_years)
+    Returns:
+      corpus: np.ndarray of shape (n_movies,) with one string per movie.
+    """
+    # Genres: 'Action|Comedy' -> 'action comedy'
+    genres_clean = (
+        movies["genres"]
+        .fillna("")
+        .replace("(no genres listed)", "", regex=False)
+        .str.replace("|", " ", regex=False)
+        .str.lower()
+        .str.strip()
+    )
 
-    num = np.c_[
-        movies["runtime"].to_numpy(dtype=np.float32),
-        movies["vote_avg"].to_numpy(dtype=np.float32),
-        np.log1p(movies["vote_count"]).to_numpy(dtype=np.float32),
-        movies["popularity"].to_numpy(dtype=np.float32),
-        inv_recency.to_numpy(dtype=np.float32),
-    ]
-    return num
+    # Tags: group by movieId -> "tag1 tag2 ..."
+    if tags.empty:
+        tag_text = pd.Series([""] * len(movies), index=movies.index, dtype="string")
+    else:
+        tags["tag"] = tags["tag"].astype(str).str.lower()
+        tag_text = (
+            tags.groupby("movieId")["tag"]
+            .apply(lambda xs: " ".join(xs))
+            .reindex(movies["movieId"])
+            .fillna("")
+            .astype("string")
+            .reset_index(drop=True)
+        )
+
+    corpus = (genres_clean + " " + tag_text).str.strip()
+    corpus = corpus.fillna("").replace("nan", "")
+    return corpus.to_numpy()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Build simple movie features from tmdb.sqlite (genres + numeric)."
+        description="Build movie features directly from MovieLens (genres + tags + rating stats)."
     )
-    ap.add_argument("--db", default="tmdb.sqlite", help="SQLite DB path")
+    ap.add_argument(
+        "--ml-dir",
+        type=Path,
+        required=True,
+        help="Path to MovieLens directory (contains movies.csv, ratings.csv, tags.csv)",
+    )
     ap.add_argument(
         "--max-features",
         type=int,
-        default=50,
-        help="TF-IDF max features (genres are few anyway)",
+        default=5000,
+        help="TF-IDF max features",
     )
     ap.add_argument(
         "--min-df",
         type=int,
-        default=1,
+        default=5,
         help="TF-IDF min document frequency",
     )
     ap.add_argument(
         "--out",
-        default="feature_store/movie_features.joblib",
+        type=Path,
+        default=Path("feature_store/movie_features.joblib"),
         help="Output joblib path",
     )
     args = ap.parse_args()
 
-    os.makedirs("feature_store", exist_ok=True)
+    os.makedirs(args.out.parent, exist_ok=True)
 
-    movies, genres = load_tables(args.db)
+    print(f"Loading MovieLens from {args.ml_dir} ...")
+    movies, ratings, tags = load_movielens(args.ml_dir)
+    print(f"Loaded {len(movies):,} movies, {len(ratings):,} ratings, {len(tags):,} tags.")
 
-    # --- text features: genres only ---
-    g_text = bag_tokens(genres, movies)
+    # Set movie_rowid == movieId (so it matches interactions)
+    movies = movies.copy()
+    movies["movie_rowid"] = movies["movieId"].astype(int)
 
-    # clean to a simple string array
-    corpus = (
-        g_text.astype("string")
-        .fillna("")
-        .str.strip()
-        .replace("nan", "")  # handle literal "nan" strings if any
-        .to_numpy()
-    )
+    # --- numeric features ---
+    print("Building numeric features...")
+    num, movies_with_stats = build_numeric_features(movies, ratings)
+
+    # --- text features (genres + tags) ---
+    print("Building text corpus (genres + tags) and TF-IDF features...")
+    corpus = build_text_corpus(movies_with_stats, tags)
 
     tfidf = TfidfVectorizer(
         max_features=args.max_features,
         min_df=args.min_df,
         lowercase=True,
         strip_accents="unicode",
+        stop_words="english",
     )
     X_tfidf = tfidf.fit_transform(corpus)
 
-    # --- numeric features ---
-    num = build_numeric_features(movies)
-
     payload = {
-        "movies": movies.reset_index(drop=True),
+        "movies": movies_with_stats.reset_index(drop=True),
         "X_tfidf": X_tfidf,
         "num": num,
         "tfidf": tfidf,
         "feature_names": {
-            "text": "genres",
-            "numeric": ["runtime", "vote_avg", "log1p_vote_count", "popularity", "inv_recency"],
+            "text": "genres+tags",
+            "numeric": [
+                "global_mean_rating",
+                "log1p_rating_count",
+                "year_norm",
+            ],
         },
     }
 
     joblib.dump(payload, args.out)
     print(
         f"✓ saved {args.out} "
-        f"({X_tfidf.shape[0]} movies x {X_tfidf.shape[1]} genre-features, "
+        f"({X_tfidf.shape[0]} movies x {X_tfidf.shape[1]} text-features, "
         f"{num.shape[1]} numeric features)"
     )
     return 0

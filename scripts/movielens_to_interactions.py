@@ -1,71 +1,67 @@
 from __future__ import annotations
 import argparse
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
 
 def load_movielens(ml_dir: Path):
-    """Load MovieLens ratings + links (basic cleanup)."""
+    """Load MovieLens ratings + movies (basic cleanup)."""
     ratings = pd.read_csv(ml_dir / "ratings.csv")
-    links = pd.read_csv(ml_dir / "links.csv")
+    movies = pd.read_csv(ml_dir / "movies.csv")
 
     ratings["userId"] = ratings["userId"].astype(int)
     ratings["movieId"] = ratings["movieId"].astype(int)
     ratings["timestamp"] = ratings["timestamp"].astype(int)
     ratings["rating"] = ratings["rating"].astype(float)
 
-    links["movieId"] = links["movieId"].astype(int)
-    links = links.dropna(subset=["tmdbId"]).copy()
-    links["tmdbId"] = links["tmdbId"].astype(int)
+    movies["movieId"] = movies["movieId"].astype(int)
 
-    return ratings, links
-
-
-def load_tmdb_movies(sqlite_path: Path) -> pd.DataFrame:
-    con = sqlite3.connect(sqlite_path)
-    try:
-        movies = pd.read_sql(
-            "SELECT id AS movie_rowid, tmdb_id, title FROM movies",
-            con,
-        )
-    finally:
-        con.close()
-    return movies
+    return ratings, movies
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Convert MovieLens ratings into interactions linked to TMDB movies."
+        description="Convert MovieLens ratings into interactions (no TMDB)."
     )
-    ap.add_argument("--ml-dir", type=Path, required=True,
-                    help="Path to MovieLens directory (ratings.csv, links.csv)")
-    ap.add_argument("--sqlite", type=Path, required=True,
-                    help="Path to tmdb.sqlite")
-    ap.add_argument("--min-user-ratings", type=int, default=0,
-                    help="Drop users with fewer ratings than this")
-    ap.add_argument("--min-movie-ratings", type=int, default=0,
-                    help="Drop movies with fewer ratings than this")
-    ap.add_argument("--out", type=Path, required=True,
-                    help="Output file (.parquet or .csv)")
+    ap.add_argument(
+        "--ml-dir",
+        type=Path,
+        required=True,
+        help="Path to MovieLens directory (ratings.csv, movies.csv)",
+    )
+    ap.add_argument(
+        "--min-user-ratings",
+        type=int,
+        default=0,
+        help="Drop users with fewer ratings than this",
+    )
+    ap.add_argument(
+        "--min-movie-ratings",
+        type=int,
+        default=0,
+        help="Drop movies with fewer ratings than this",
+    )
+    ap.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Output file (.parquet or .csv)",
+    )
     args = ap.parse_args()
 
-    ratings, links = load_movielens(args.ml_dir)
-    tmdb_movies = load_tmdb_movies(args.sqlite)
+    ratings, movies = load_movielens(args.ml_dir)
 
-    # 1) attach tmdbId to ratings
-    df = ratings.merge(links[["movieId", "tmdbId"]], on="movieId", how="left")
-    df = df.dropna(subset=["tmdbId"]).copy()
-    df["tmdb_id"] = df["tmdbId"].astype(int)
+    # Attach titles
+    df = ratings.merge(movies[["movieId", "title"]], on="movieId", how="left")
 
-    # 2) join with local TMDB movies (keep only movies we scraped)
-    df = df.merge(tmdb_movies, on="tmdb_id", how="inner")
+    # Define movie_rowid == movieId (to match movie_features.movies.movie_rowid)
+    df["movie_rowid"] = df["movieId"].astype(int)
 
-    # keep only columns we care about
-    df = df[["userId", "movie_rowid", "tmdb_id", "rating", "timestamp", "title"]]
+    # Keep only columns we care about
+    df = df[["userId", "movie_rowid", "rating", "timestamp", "title"]]
 
-    # 3) apply min counts
+    # Apply min counts
     if args.min_user_ratings > 0:
         user_counts = df["userId"].value_counts()
         keep_users = user_counts[user_counts >= args.min_user_ratings].index
@@ -76,10 +72,10 @@ def main() -> int:
         keep_movies = movie_counts[movie_counts >= args.min_movie_ratings].index
         df = df[df["movie_rowid"].isin(keep_movies)]
 
-    # 4) sort for nicer inspection
+    # Sort for nicer inspection
     df = df.sort_values(["userId", "movie_rowid", "timestamp"]).reset_index(drop=True)
 
-    # 5) write output
+    # Write output
     args.out.parent.mkdir(parents=True, exist_ok=True)
     if args.out.suffix.lower() == ".csv":
         df.to_csv(args.out, index=False)

@@ -5,3 +5,4 @@ requests
 python-dotenv
 joblib
 aiohttp
+ipywidgets

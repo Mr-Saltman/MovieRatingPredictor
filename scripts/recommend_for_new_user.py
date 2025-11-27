@@ -8,7 +8,28 @@ import numpy as np
 import pandas as pd
 import joblib
 from scipy.sparse import csr_matrix, hstack
+import os
+import requests
 
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TMDB_BASE_IMG = "https://image.tmdb.org/t/p/w342"
+
+def fetch_tmdb_details(tmdb_id: int) -> dict | None:
+    """Fetch movie details from TMDB API for UI / display purposes."""
+    if not TMDB_API_KEY or pd.isna(tmdb_id):
+        return None
+
+    url = f"https://api.themoviedb.org/3/movie/{int(tmdb_id)}"
+    params = {"api_key": TMDB_API_KEY}
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+    except requests.RequestException as e:
+        print(f"TMDB request failed for {tmdb_id}: {e}")
+        return None
 
 # ---------- loading ----------
 
@@ -135,25 +156,52 @@ def choose_profile(
 # ---------- user rating collection ----------
 
 def print_movie_context(row: pd.Series) -> None:
-    """Print title, overview and TMDB link (if available) for a movie."""
+    """Print title, overview and TMDB link (if available)."""
     title = row.get("title", "Unknown title")
-    overview = row.get("overview") or ""
     tmdb_id = row.get("tmdb_id")
 
-    print(f"\nTitle: {title}")
+    # Start with MovieLens title
+    display_title = str(title)
+
+    overview = ""
+    year = None
+    poster_url = None
+
+    details = None
+    if pd.notna(tmdb_id):
+        details = fetch_tmdb_details(tmdb_id)
+        if details is not None:
+            if details.get("title"):
+                display_title = details["title"]
+            overview = details.get("overview") or ""
+            rd = details.get("release_date") or ""
+            if len(rd) >= 4:
+                year = rd[:4]
+            poster_path = details.get("poster_path")
+            if poster_path:
+                poster_url = f"{TMDB_BASE_IMG}{poster_path}"
+
+    print("\nTitle:", display_title)
+    if year:
+        print("Year :", year)
+
     if overview:
-        # truncate long overviews to keep terminal readable
         text = str(overview).strip()
         if len(text) > 500:
             text = text[:500] + "..."
-        print(f"Overview: {text}")
+        print("Overview:", text)
+
     if pd.notna(tmdb_id):
         try:
             tmdb_int = int(tmdb_id)
             print(f"TMDB page: https://www.themoviedb.org/movie/{tmdb_int}")
         except (ValueError, TypeError):
             pass
-    print()  # blank line
+
+    if poster_url:
+        print("Poster:", poster_url)
+
+    print()
 
 
 def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]:
@@ -245,13 +293,10 @@ def build_user_profile(
     user_ratings: Dict[int, float],
 ) -> np.ndarray:
     """
-    Build a user profile vector in TF-IDF genre space from this user's ratings.
+    Build a user profile vector in TF-IDF space from this user's ratings.
 
-    Steps:
-      - Map rated movie_rowid -> row indices in X_tfidf
-      - Take those rows
-      - Compute a weighted average using *centered* ratings (rating - mean)
-      - L2-normalize
+    Uses *centered* ratings (rating - mean), keeping both likes (positive)
+    and dislikes (negative) as signed weights, then L2-normalizes.
     """
     if not user_ratings:
         raise ValueError("No user ratings provided")
@@ -259,7 +304,6 @@ def build_user_profile(
     movie_to_idx = pd.Series(movies.index.values, index=movies["movie_rowid"])
     rated_ids = list(user_ratings.keys())
 
-    # Keep only rated movies that exist in our feature matrix
     keep_ids = [mid for mid in rated_ids if mid in movie_to_idx.index]
     if not keep_ids:
         raise ValueError("None of the rated movies are present in the feature matrix")
@@ -267,24 +311,22 @@ def build_user_profile(
     ratings_arr = np.array([user_ratings[mid] for mid in keep_ids], dtype=float)
     user_mean = ratings_arr.mean()
 
+    # signed weights: positive for above-mean, negative for below-mean
     deltas = ratings_arr - user_mean
-    pos_mask = deltas > 0.0
-
-    if not np.any(pos_mask):
-        # fallback: use raw ratings if somehow everything is <= mean
+    if np.allclose(deltas, 0.0):
+        # fallback: if all ratings identical, just use raw ratings as weights
         weights = ratings_arr.reshape(-1, 1)
-        rows = movie_to_idx.loc[keep_ids].to_numpy(dtype=int)
     else:
-        weights = deltas[pos_mask].reshape(-1, 1)
-        rows = movie_to_idx.loc[[keep_ids[i] for i, m in enumerate(pos_mask) if m]].to_numpy(dtype=int)
+        weights = deltas.reshape(-1, 1)
 
-    V = X_tfidf[rows]
-    num = V.T @ weights
-    profile = np.asarray(num).ravel()
+    rows = movie_to_idx.loc[keep_ids].to_numpy(dtype=int)
+    V = X_tfidf[rows]                      # (n_rated, d)
+    profile_vec = V.T @ weights            # (d, 1)
+    profile = np.asarray(profile_vec).ravel()
 
-    denom = weights.sum()
+    denom = np.sum(np.abs(weights))
     if denom <= 0:
-        raise ValueError("Sum of profile weights is non-positive.")
+        raise ValueError("Sum of absolute profile weights is non-positive.")
 
     profile = profile / denom
     profile = l2_normalize(profile)
@@ -333,8 +375,11 @@ def recommend_for_user(
     num: np.ndarray,
     user_ratings: Dict[int, float],
     num_recs: int = 10,
+    candidate_top_n: int = 5000,
+    min_year: int | None = 1990,  # tweak this if you want
 ):
     """Predict ratings for all movies and return top recommendations."""
+
     # user bias feature
     user_mean_rating = float(np.mean(list(user_ratings.values())))
     print(f"Estimated user_mean_rating: {user_mean_rating:.3f}")
@@ -351,22 +396,58 @@ def recommend_for_user(
         user_profile=user_profile,
     )
 
-    # predict ratings for all movies
     print("Predicting ratings for all movies...")
     y_pred = model.predict(X_user_all)
 
-    # Build DataFrame with predictions
-    preds = movies[["movie_rowid", "title", "overview", "tmdb_id"]].copy()
+    # --- robust column selection ---
+    base_cols = ["movie_rowid", "title"]
+    extra_cols = []
+    if "overview" in movies.columns:
+        extra_cols.append("overview")
+    if "tmdb_id" in movies.columns:
+        extra_cols.append("tmdb_id")
+    if "release_date" in movies.columns:
+        extra_cols.append("release_date")
+    if "n_ratings" in movies.columns:
+        extra_cols.append("n_ratings")
+    if "vote_count" in movies.columns:
+        extra_cols.append("vote_count")
+    if "popularity" in movies.columns:
+        extra_cols.append("popularity")
+
+    preds = movies[base_cols + extra_cols].copy()
+
+    if "overview" not in preds.columns:
+        preds["overview"] = ""
+    if "tmdb_id" not in preds.columns:
+        preds["tmdb_id"] = np.nan
+
     preds["pred_rating"] = y_pred
 
-    # exclude movies the user already rated
+    # Filter out already-rated movies
     rated_ids = set(user_ratings.keys())
     preds = preds[~preds["movie_rowid"].isin(rated_ids)]
 
-    # sort by predicted rating, highest first
-    preds = preds.sort_values("pred_rating", ascending=False)
+    if "release_date" in preds.columns and min_year is not None:
+        rd = pd.to_datetime(preds["release_date"], errors="coerce")
+        preds["release_year"] = rd.dt.year.fillna(1900).astype(int)
+        preds = preds[preds["release_year"] >= min_year]
 
-    # take top N
+    # Sort: primary = predicted rating, tie-breakers = popularity-ish
+    sort_cols = ["pred_rating"]
+    ascending = [False]
+
+    for col in ["n_ratings", "vote_count", "popularity"]:
+        if col in preds.columns:
+            sort_cols.append(col)
+            ascending.append(False)
+
+    preds = preds.sort_values(sort_cols, ascending=ascending)
+
+    # Limit global candidate pool then take final top
+    if candidate_top_n is not None and candidate_top_n > 0:
+        preds = preds.head(candidate_top_n)
+
     top = preds.head(num_recs).reset_index(drop=True)
     return top
 
@@ -464,30 +545,35 @@ def select_candidate_movies(
     per_genre: int = 5,
     top_genres: int = 8,
     extra_random: int = 20,
+    min_year: int | None = None,
 ) -> pd.DataFrame:
     """
     Select a diverse pool of movies to ask the user about.
-
-    Strategy:
-      - determine the top `top_genres` TF-IDF genre dimensions (by document frequency),
-      - for each such genre, pick `per_genre` most popular movies that have that genre,
-      - then fill up with remaining most popular movies,
-      - shuffle the result.
     """
     cols = movies.columns
+    base = movies.copy()
+
+    # Filter by year for the candidate pool as well
+    if "release_date" in base.columns and min_year is not None:
+        rd = pd.to_datetime(base["release_date"], errors="coerce")
+        base["release_year"] = rd.dt.year.fillna(1900).astype(int)
+        base = base[base["release_year"] >= min_year]
+
     sort_cols = []
+    if "n_ratings" in cols:
+        sort_cols.append("n_ratings")
     if "vote_count" in cols:
         sort_cols.append("vote_count")
     if "popularity" in cols:
         sort_cols.append("popularity")
 
     if sort_cols:
-        base = movies.sort_values(sort_cols, ascending=False).reset_index(drop=True)
+        base = base.sort_values(sort_cols, ascending=False).reset_index(drop=True)
     else:
-        base = movies.sample(frac=1.0).reset_index(drop=True)
+        base = base.sample(frac=1.0).reset_index(drop=True)
 
     # 1) Document frequency per genre column
-    df = (X_tfidf > 0).sum(axis=0)  # shape (1, d)
+    df = (X_tfidf > 0).sum(axis=0)
     df = np.asarray(df).ravel()
 
     top_cols = np.argsort(df)[::-1][:top_genres]
@@ -593,6 +679,34 @@ def main() -> int:
 
     print(f"Current profile '{profile_name}' has {len(user_ratings)} ratings/preferences.\n")
 
+    # If the user already has enough ratings and num-rate is 0,
+    # go straight to recommendations/refinement.
+    if len(user_ratings) >= args.min_ratings and args.num_rate <= 0:
+        print(
+            f"Profile '{profile_name}' already has {len(user_ratings)} ratings "
+            f"(>= min_ratings={args.min_ratings}). Skipping new rating phase."
+        )
+
+        top = refine_with_recommendations(
+            model=model,
+            movies=movies,
+            X_tfidf=X_tfidf,
+            num=num,
+            user_ratings=user_ratings,
+            num_recs=args.num_recs,
+        )
+
+        save_user_ratings(profile_path, user_ratings)
+        print(f"\nSaved {len(user_ratings)} total ratings/preferences to profile '{profile_name}'.\n")
+
+        print("\n=== Final Top Recommendations for You ===")
+        for i, row in top.iterrows():
+            title = row.get("title", "Unknown title")
+            pred = row["pred_rating"]
+            print(f"{i+1:2d}. {title}  (predicted rating: {pred:.2f})")
+        print("\nDone.")
+        return 0
+
     # 3) choose a diverse pool of popular movies, excluding already rated ones
     candidate_pool = select_candidate_movies(
         movies,
@@ -600,6 +714,7 @@ def main() -> int:
         per_genre=5,
         top_genres=8,
         extra_random=20,
+        min_year=1990,
     )
 
     if user_ratings:
