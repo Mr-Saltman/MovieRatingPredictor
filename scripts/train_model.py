@@ -11,9 +11,6 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-
-# ---------- data loaders ----------
-
 def load_interactions(path: Path) -> pd.DataFrame:
     """Load interactions from CSV or Parquet and normalize dtypes."""
     if path.suffix.lower() == ".parquet":
@@ -38,8 +35,6 @@ def load_movie_features(path: Path) -> dict:
     """Load movie_features.joblib (movies, X_tfidf, num, ...)."""
     return joblib.load(path)
 
-
-# ---------- small helpers ----------
 
 def l2_normalize(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Return vec / ||vec|| (L2 norm), or vec if norm is too small."""
@@ -84,8 +79,8 @@ def build_user_profiles_from_interactions(
         rows = rows[pos_mask]
         weights = deltas[pos_mask].reshape(-1, 1)
 
-        V = X_tfidf[rows]            # (n_liked, d)
-        num = V.T @ weights          # (d, 1)
+        V = X_tfidf[rows]
+        num = V.T @ weights
         centroid = np.asarray(num).ravel()
         denom = weights.sum()
         if denom <= 0:
@@ -96,9 +91,6 @@ def build_user_profiles_from_interactions(
         profiles[int(uid)] = centroid
 
     return profiles
-
-
-# ---------- feature builder ----------
 
 def build_design_matrix(
     interactions: pd.DataFrame,
@@ -128,9 +120,9 @@ def build_design_matrix(
 
     # movie features
     rows = interactions["row_idx"].to_numpy(dtype=int)
-    X_text = X_tfidf[rows]            # sparse
-    X_num_dense = num[rows]           # (n_samples, d_num)
-    X_num = csr_matrix(X_num_dense)   # as sparse
+    X_text = X_tfidf[rows]
+    X_num_dense = num[rows]
+    X_num = csr_matrix(X_num_dense)
 
     # user feature: mean rating per user (user bias)
     interactions["user_mean_rating"] = (
@@ -155,20 +147,17 @@ def build_design_matrix(
         prof = profiles.get(row.userId)
         if prof is None:
             continue
-        v = X_tfidf[row.row_idx]                    # (1, d)
-        sims[i] = float(v.dot(prof)[0])             # scalar
+        v = X_tfidf[row.row_idx]
+        sims[i] = float(v.dot(prof)[0])
 
     sims *= 10.0  # scale
-    X_sim = csr_matrix(sims.reshape(-1, 1))         # (n_samples, 1)
+    X_sim = csr_matrix(sims.reshape(-1, 1))
 
     # Stack everything horizontally: [tfidf | numeric | user_mean | user_movie_sim]
     X = hstack([X_text, X_num, X_user, X_sim]).tocsr()
     y = interactions["rating"].to_numpy(dtype=float)
 
     return X, y
-
-
-# ---------- training ----------
 
 def train_model(
     interactions_path: Path,
@@ -182,7 +171,7 @@ def train_model(
     interactions = load_interactions(interactions_path)
     print(f"Total interactions: {len(interactions):,}")
 
-    # Optional subsampling
+    # Subsampling
     if max_samples is not None and len(interactions) > max_samples:
         print(f"Subsampling to {max_samples:,} interactions (from {len(interactions):,}) ...")
         interactions = interactions.sample(n=max_samples, random_state=42).reset_index(drop=True)
@@ -234,10 +223,7 @@ def train_model(
         ),
     }
     joblib.dump(payload, model_out)
-    print(f"\n✓ Saved trained model to {model_out}")
-
-
-# ---------- CLI ----------
+    print(f"\nSaved trained model to {model_out}")
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train a Ridge regression rating predictor.")

@@ -46,7 +46,7 @@ def main() -> int:
         "--out",
         type=Path,
         required=True,
-        help="Output file (.parquet or .csv)",
+        help="Output file (.csv)",
     )
     args = ap.parse_args()
 
@@ -79,15 +79,13 @@ def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     if args.out.suffix.lower() == ".csv":
         df.to_csv(args.out, index=False)
-    elif args.out.suffix.lower() == ".parquet":
-        df.to_parquet(args.out, index=False)
     else:
-        raise ValueError("Output must be .parquet or .csv")
+        raise ValueError("Output must be .csv")
 
     print(
-        f"✓ wrote {len(df):,} interactions for "
+        f"Wrote {len(df):,} interactions for "
         f"{df['userId'].nunique():,} users and "
-        f"{df['movie_rowid'].nunique():,} movies → {args.out}"
+        f"{df['movie_rowid'].nunique():,} movies => {args.out}"
     )
     return 0
 

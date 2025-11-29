@@ -22,13 +22,11 @@ def load_movielens(ml_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
     else:
         tags = pd.DataFrame(columns=["userId", "movieId", "tag", "timestamp"])
 
-    # NEW: links for tmdb_id
     links = pd.read_csv(ml_dir / "links.csv")
     links["movieId"] = links["movieId"].astype(int)
     links = links.dropna(subset=["tmdbId"]).copy()
     links["tmdbId"] = links["tmdbId"].astype(int)
 
-    # Basic dtypes
     movies["movieId"] = movies["movieId"].astype(int)
     ratings["movieId"] = ratings["movieId"].astype(int)
     ratings["userId"] = ratings["userId"].astype(int)
@@ -45,7 +43,7 @@ def load_movielens(ml_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFra
     return movies, ratings, tags
 
 
-def extract_year_from_title(title: str) -> float | np.nan:
+def extract_year_from_title(title: str) -> float | None:
     """
     MovieLens titles often look like 'Toy Story (1995)'.
     Extract the year as a float, or NaN if not found.
@@ -57,17 +55,17 @@ def extract_year_from_title(title: str) -> float | np.nan:
         try:
             return float(m.group(1))
         except ValueError:
-            return np.nan
-    return np.nan
+            return None
+    return None
 
 
 def build_numeric_features(movies: pd.DataFrame, ratings: pd.DataFrame) -> np.ndarray:
     """
     Build numeric features for each movie:
 
-      - global_mean_rating     (MovieLens mean rating per movie)
-      - log1p_rating_count     (log(1 + #ratings))
-      - year_norm              (release year normalized to [0, 1])
+      - global_mean_rating (MovieLens mean rating per movie)
+      - log1p_rating_count (log(1 + #ratings))
+      - year_norm (release year normalized to [0, 1])
 
     Returns:
       num: ndarray of shape (n_movies, 3)
@@ -221,7 +219,7 @@ def main() -> int:
 
     joblib.dump(payload, args.out)
     print(
-        f"✓ saved {args.out} "
+        f"Saved {args.out} "
         f"({X_tfidf.shape[0]} movies x {X_tfidf.shape[1]} text-features, "
         f"{num.shape[1]} numeric features)"
     )

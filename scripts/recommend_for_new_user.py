@@ -31,23 +31,17 @@ def fetch_tmdb_details(tmdb_id: int) -> dict | None:
         print(f"TMDB request failed for {tmdb_id}: {e}")
         return None
 
-# ---------- loading ----------
-
 def load_model_and_features(model_path: Path, features_path: Path):
     """Load trained Ridge model and movie feature store."""
     model_payload = joblib.load(model_path)
     model = model_payload["model"]
 
     fs = joblib.load(features_path)
-    # movies has: movie_rowid, tmdb_id, title, overview, runtime, vote_avg, vote_count, popularity, release_date
     movies = fs["movies"]
-    X_tfidf = fs["X_tfidf"]        # sparse text features
-    num = fs["num"]                # numeric features (numpy array)
+    X_tfidf = fs["X_tfidf"]
+    num = fs["num"]
 
     return model, movies, X_tfidf, num
-
-
-# ---------- profile + ratings persistence ----------
 
 def load_user_ratings(path: Path) -> Dict[int, float]:
     """Load saved user ratings from a JSON file (if it exists)."""
@@ -57,7 +51,6 @@ def load_user_ratings(path: Path) -> Dict[int, float]:
         raw = json.load(f)
     # JSON keys are strings; convert back to int
     return {int(k): float(v) for k, v in raw.items()}
-
 
 def save_user_ratings(path: Path, ratings: Dict[int, float]) -> None:
     """Save user ratings to a JSON file."""
@@ -152,9 +145,6 @@ def choose_profile(
             print(f"Starting new profile '{name}'.\n")
         return name, ratings, path
 
-
-# ---------- user rating collection ----------
-
 def print_movie_context(row: pd.Series) -> None:
     """Print title, overview and TMDB link (if available)."""
     title = row.get("title", "Unknown title")
@@ -215,8 +205,6 @@ def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]
     print("\n=== Step 1: Please rate some movies ===")
     print("For each movie, respond with:")
     print("  - 1–5   : rating if you've seen it")
-    print("  - i     : interested (but not seen)  → treated as ~4.0")
-    print("  - n     : not interested             → treated as ~2.0")
     print("  - ENTER : skip")
     print("  - q     : quit rating\n")
 
@@ -236,7 +224,7 @@ def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]
 
         prompt = (
             f"[{len(ratings)+1}/{num_to_rate}] "
-            "Your response (1-5 / i / n / ENTER=skip / q=quit): "
+            "Your response (1-5 / ENTER=skip / q=quit): "
         )
 
         while True:
@@ -248,15 +236,7 @@ def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]
                 break
 
             if val == "":
-                rating = None  # skip this movie
-                break
-
-            if val == "i":
-                rating = 4.0
-                break
-
-            if val == "n":
-                rating = 2.0
+                rating = None
                 break
 
             try:
@@ -264,9 +244,9 @@ def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]
                 if 1.0 <= rating <= 5.0:
                     break
                 else:
-                    print("Please enter a number between 1.0 and 5.0, 'i', 'n', ENTER, or 'q'.")
+                    print("Please enter a number between 1.0 and 5.0, ENTER, or 'q'.")
             except ValueError:
-                print("Invalid input. Please enter 1–5, 'i', 'n', ENTER, or 'q'.")
+                print("Invalid input. Please enter 1–5, ENTER, or 'q'.")
 
         if val == "q":
             break
@@ -277,63 +257,50 @@ def ask_user_ratings(movies: pd.DataFrame, num_to_rate: int) -> Dict[int, float]
     print(f"\nThanks! You provided {len(ratings)} new ratings/preferences in this round.\n")
     return ratings
 
-
-# ---------- user genre profile ----------
-
 def l2_normalize(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     norm = np.linalg.norm(vec)
     if norm < eps:
         return vec
     return vec / norm
 
-
 def build_user_profile(
     movies: pd.DataFrame,
     X_tfidf,
     user_ratings: Dict[int, float],
 ) -> np.ndarray:
-    """
-    Build a user profile vector in TF-IDF space from this user's ratings.
-
-    Uses *centered* ratings (rating - mean), keeping both likes (positive)
-    and dislikes (negative) as signed weights, then L2-normalizes.
-    """
     if not user_ratings:
         raise ValueError("No user ratings provided")
 
     movie_to_idx = pd.Series(movies.index.values, index=movies["movie_rowid"])
-    rated_ids = list(user_ratings.keys())
-
-    keep_ids = [mid for mid in rated_ids if mid in movie_to_idx.index]
-    if not keep_ids:
+    rated_ids = [mid for mid in user_ratings.keys() if mid in movie_to_idx.index]
+    if not rated_ids:
         raise ValueError("None of the rated movies are present in the feature matrix")
 
-    ratings_arr = np.array([user_ratings[mid] for mid in keep_ids], dtype=float)
+    ratings_arr = np.array([user_ratings[mid] for mid in rated_ids], dtype=float)
     user_mean = ratings_arr.mean()
-
-    # signed weights: positive for above-mean, negative for below-mean
     deltas = ratings_arr - user_mean
-    if np.allclose(deltas, 0.0):
-        # fallback: if all ratings identical, just use raw ratings as weights
-        weights = ratings_arr.reshape(-1, 1)
-    else:
-        weights = deltas.reshape(-1, 1)
 
-    rows = movie_to_idx.loc[keep_ids].to_numpy(dtype=int)
-    V = X_tfidf[rows]                      # (n_rated, d)
-    profile_vec = V.T @ weights            # (d, 1)
+    # keep only positive deltas (liked more than the user's baseline)
+    pos_mask = deltas > 0.0
+    if not np.any(pos_mask):
+        # fallback: use all ratings as weights if nothing is above mean
+        weights = ratings_arr.reshape(-1, 1)
+        rows = movie_to_idx.loc[rated_ids].to_numpy(dtype=int)
+    else:
+        weights = deltas[pos_mask].reshape(-1, 1)
+        rows = movie_to_idx.loc[np.array(rated_ids)[pos_mask]].to_numpy(dtype=int)
+
+    V = X_tfidf[rows]
+    profile_vec = V.T @ weights
     profile = np.asarray(profile_vec).ravel()
 
-    denom = np.sum(np.abs(weights))
+    denom = weights.sum()
     if denom <= 0:
-        raise ValueError("Sum of absolute profile weights is non-positive.")
+        raise ValueError("Sum of profile weights is non-positive.")
 
     profile = profile / denom
     profile = l2_normalize(profile)
     return profile
-
-
-# ---------- feature matrix for this user ----------
 
 def build_feature_matrix_for_user(
     X_tfidf,
@@ -348,25 +315,21 @@ def build_feature_matrix_for_user(
     """
     n_movies = X_tfidf.shape[0]
 
-    # TF-IDF and numeric features
-    X_text = X_tfidf                      # (n_movies, d_text)
-    X_num = csr_matrix(num)               # (n_movies, d_num)
+    X_text = X_tfidf
+    X_num = csr_matrix(num)
 
     # user_mean_rating: same scalar for all movies
     user_col = np.full((n_movies, 1), user_mean_rating, dtype=np.float32)
-    X_user = csr_matrix(user_col)         # (n_movies, 1)
+    X_user = csr_matrix(user_col)
 
     # similarity between each movie and user profile
-    sims = X_tfidf @ user_profile         # (n_movies,)
+    sims = X_tfidf @ user_profile
     sims = np.asarray(sims).ravel().astype(np.float32)
     sims *= 10.0  # scale same as in training
-    X_sim = csr_matrix(sims.reshape(-1, 1))  # (n_movies, 1)
+    X_sim = csr_matrix(sims.reshape(-1, 1))
 
     X = hstack([X_text, X_num, X_user, X_sim]).tocsr()
     return X
-
-
-# ---------- recommendation ----------
 
 def recommend_for_user(
     model,
@@ -376,7 +339,8 @@ def recommend_for_user(
     user_ratings: Dict[int, float],
     num_recs: int = 10,
     candidate_top_n: int = 5000,
-    min_year: int | None = 1990,  # tweak this if you want
+    min_year: int | None = 1990,
+    min_n_ratings: int = 50,
 ):
     """Predict ratings for all movies and return top recommendations."""
 
@@ -414,6 +378,8 @@ def recommend_for_user(
         extra_cols.append("vote_count")
     if "popularity" in movies.columns:
         extra_cols.append("popularity")
+    if "year" in movies.columns:
+        extra_cols.append("year")
 
     preds = movies[base_cols + extra_cols].copy()
 
@@ -428,10 +394,24 @@ def recommend_for_user(
     rated_ids = set(user_ratings.keys())
     preds = preds[~preds["movie_rowid"].isin(rated_ids)]
 
-    if "release_date" in preds.columns and min_year is not None:
-        rd = pd.to_datetime(preds["release_date"], errors="coerce")
-        preds["release_year"] = rd.dt.year.fillna(1900).astype(int)
+    if min_year is not None:
+        if "release_date" in preds.columns:
+            rd = pd.to_datetime(preds["release_date"], errors="coerce")
+            preds["release_year"] = rd.dt.year
+        elif "year" in preds.columns:
+            # year came from MovieLens title (float) → cast to Int and treat NaN as old
+            preds["release_year"] = (
+                preds["year"]
+                .fillna(0)
+                .astype(int)
+            )
+        else:
+            preds["release_year"] = 0  # no usable info → treat as old
+
         preds = preds[preds["release_year"] >= min_year]
+
+    if "n_ratings" in preds.columns and min_n_ratings is not None:
+        preds = preds[preds["n_ratings"] >= min_n_ratings]
 
     # Sort: primary = predicted rating, tie-breakers = popularity-ish
     sort_cols = ["pred_rating"]
@@ -480,8 +460,6 @@ def refine_with_recommendations(
     print("Give feedback to refine recommendations.")
     print("For each movie, respond with:")
     print("  - 1–5   : rating if you've seen it")
-    print("  - i     : interested (but not seen)  → treated as ~4.0")
-    print("  - n     : not interested             → treated as ~2.0")
     print("  - ENTER : skip\n")
 
     added_feedback = 0
@@ -496,17 +474,11 @@ def refine_with_recommendations(
         print_movie_context(row)
         pred = row["pred_rating"]
 
-        prompt = f"(Predicted rating: {pred:.2f}) -> [1-5 / i / n / ENTER]: "
+        prompt = f"(Predicted rating: {pred:.2f}) -> [1-5 / ENTER=skip]: "
         val = input(prompt).strip().lower().replace(",", ".")
 
         if val == "":
             continue
-        if val == "i":
-            user_ratings[movie_id] = 4.0
-            added_feedback += 1
-        elif val == "n":
-            user_ratings[movie_id] = 2.0
-            added_feedback += 1
         else:
             try:
                 r = float(val)
@@ -545,67 +517,130 @@ def select_candidate_movies(
     per_genre: int = 5,
     top_genres: int = 8,
     extra_random: int = 20,
+    min_n_ratings: int = 50,
     min_year: int | None = None,
+    random_state: int | None = None,
 ) -> pd.DataFrame:
     """
     Select a diverse pool of movies to ask the user about.
+
+    - filters by min_year using release_date or year
+    - prefers popular movies (n_ratings / vote_count / popularity)
+    - samples randomly within each genre/token bucket to avoid giving
+      identical sets to every new profile
     """
-    cols = movies.columns
+    rng = np.random.default_rng(random_state)
+
+    # start from full movie list (same length as X_tfidf)
     base = movies.copy()
 
-    # Filter by year for the candidate pool as well
-    if "release_date" in base.columns and min_year is not None:
-        rd = pd.to_datetime(base["release_date"], errors="coerce")
-        base["release_year"] = rd.dt.year.fillna(1900).astype(int)
+    # --- year filter (same logic we discussed) ---
+    if min_year is not None:
+        if "release_date" in base.columns:
+            rd = pd.to_datetime(base["release_date"], errors="coerce")
+            base["release_year"] = rd.dt.year
+        elif "year" in base.columns:
+            base["release_year"] = base["year"].fillna(0).astype(int)
+        else:
+            base["release_year"] = 0
+
         base = base[base["release_year"] >= min_year]
 
+    if "n_ratings" in base.columns and min_n_ratings is not None:
+        base = base[base["n_ratings"] >= min_n_ratings]
+
+    if base.empty:
+        return base
+
+    # sort by popularity-ish metrics (descending)
     sort_cols = []
-    if "n_ratings" in cols:
+    if "n_ratings" in base.columns:
         sort_cols.append("n_ratings")
-    if "vote_count" in cols:
+    if "vote_count" in base.columns:
         sort_cols.append("vote_count")
-    if "popularity" in cols:
+    if "popularity" in base.columns:
         sort_cols.append("popularity")
 
     if sort_cols:
         base = base.sort_values(sort_cols, ascending=False).reset_index(drop=True)
     else:
-        base = base.sample(frac=1.0).reset_index(drop=True)
+        base = base.sample(
+            frac=1.0,
+            random_state=rng.integers(1_000_000_000),
+        ).reset_index(drop=True)
 
-    # 1) Document frequency per genre column
-    df = (X_tfidf > 0).sum(axis=0)
-    df = np.asarray(df).ravel()
+    # sanity check: X_tfidf rows must align with movies rows
+    if X_tfidf.shape[0] != len(movies):
+        raise ValueError(
+            f"X_tfidf has {X_tfidf.shape[0]} rows, but movies has {len(movies)} rows. "
+            "They must match."
+        )
 
+    # document frequency per column (token)
+    df = np.asarray((X_tfidf > 0).sum(axis=0)).ravel()
     top_cols = np.argsort(df)[::-1][:top_genres]
 
     selected_ids: set[int] = set()
     candidates: list[pd.Series] = []
 
+    # --- per-token sampling ---
     for col_idx in top_cols:
         col_vec = X_tfidf[:, col_idx]
+        # mask over ALL movies (same length as movies, not base)
         mask = col_vec.toarray().ravel() > 0
-        genre_movies = base[mask]
 
-        for _, row in genre_movies.head(per_genre).iterrows():
+        # movie_rowids that contain this token
+        token_movie_ids = movies.loc[mask, "movie_rowid"].astype(int)
+
+        # restrict to the year-filtered/popularity-sorted base
+        genre_movies = base[base["movie_rowid"].isin(token_movie_ids)]
+
+        if genre_movies.empty:
+            continue
+
+        # within this token, take top-K popular, then sample per_genre
+        top_k = min(len(genre_movies), 200)
+        genre_top = genre_movies.head(top_k)
+        n_sample = min(per_genre, len(genre_top))
+
+        sampled = genre_top.sample(
+            n=n_sample,
+            random_state=rng.integers(1_000_000_000),
+            replace=False,
+        )
+
+        for _, row in sampled.iterrows():
             mid = int(row["movie_rowid"])
             if mid in selected_ids:
                 continue
             selected_ids.add(mid)
             candidates.append(row)
 
-    target_total = per_genre * top_genres + extra_random
-    if len(candidates) < target_total:
-        for _, row in base.iterrows():
-            mid = int(row["movie_rowid"])
-            if mid in selected_ids:
-                continue
-            selected_ids.add(mid)
-            candidates.append(row)
-            if len(candidates) >= target_total:
-                break
+    # --- random tail to cover other stuff ---
+    if extra_random > 0:
+        remaining = base[~base["movie_rowid"].isin(selected_ids)]
+        if not remaining.empty:
+            n_extra = min(extra_random, len(remaining))
+            extra = remaining.sample(
+                n=n_extra,
+                random_state=rng.integers(1_000_000_000),
+                replace=False,
+            )
+            for _, row in extra.iterrows():
+                mid = int(row["movie_rowid"])
+                if mid in selected_ids:
+                    continue
+                selected_ids.add(mid)
+                candidates.append(row)
 
-    cand_df = pd.DataFrame(candidates)
-    cand_df = cand_df.sample(frac=1.0).reset_index(drop=True)
+    cand_df = pd.DataFrame(candidates).drop_duplicates(subset=["movie_rowid"])
+
+    # final shuffle so the order isn’t deterministic
+    cand_df = cand_df.sample(
+        frac=1.0,
+        random_state=rng.integers(1_000_000_000),
+    ).reset_index(drop=True)
+
     return cand_df
 
 
