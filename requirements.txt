@@ -6,3 +6,4 @@ python-dotenv
 joblib
 aiohttp
 ipywidgets
+matplotlib

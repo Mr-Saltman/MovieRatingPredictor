@@ -40,8 +40,9 @@ def load_model_and_features(model_path: Path, features_path: Path):
     movies = fs["movies"]
     X_tfidf = fs["X_tfidf"]
     num = fs["num"]
+    tfidf = fs["tfidf"]
 
-    return model, movies, X_tfidf, num
+    return model, movies, X_tfidf, num, tfidf
 
 def load_user_ratings(path: Path) -> Dict[int, float]:
     """Load saved user ratings from a JSON file (if it exists)."""
