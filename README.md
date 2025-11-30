@@ -19,12 +19,7 @@ A hybrid content-based movie recommender system using TF-IDF features, user prof
 6. **movie-rating-prediction_pipeline.ipynb** - Full UI + workflow
 
 ## ▶️ Basic Usage
-```bash
-python scripts/build_movie_features.py
-python scripts/movielens_to_interactions.py
-python scripts/train_model.py
-python scripts/recommend_for_new_user.py --profile myprofile
-```
+Follow the steps in the Jupyter Notebook file.
 
 ## 🧰 Requirements
 - PIP Packages to be installed from *requirements.txt*
