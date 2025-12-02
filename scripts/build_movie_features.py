@@ -130,7 +130,7 @@ def build_text_corpus(movies: pd.DataFrame, tags: pd.DataFrame) -> np.ndarray:
     if tags.empty:
         tag_text = pd.Series([""] * len(movies), index=movies.index, dtype="string")
     else:
-        tags["tag"] = tags["tag"].astype(str).str.lower()
+        tags["tag"] = tags["tag"].astype(str).str.lower().str.replace(r"[^a-z0-9]+", " ", regex=True).str.strip()
         tag_text = (
             tags.groupby("movieId")["tag"]
             .apply(lambda xs: " ".join(xs))
